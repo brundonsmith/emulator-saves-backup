@@ -1,11 +1,13 @@
-use anyhow::{Context, Result};
-use reqwest::blocking::Client;
+use anyhow::{Context, Result, anyhow};
+use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 use walkdir::WalkDir;
 
@@ -57,19 +59,23 @@ fn get_access_token(client: &Client) -> Result<String> {
     let secret = env::var("DROPBOX_APP_SECRET")?;
     let refresh = env::var("DROPBOX_REFRESH_TOKEN")?;
 
-    let resp = client
-        .post("https://api.dropbox.com/oauth2/token")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh.as_str()),
-            ("client_id", key.as_str()),
-            ("client_secret", secret.as_str()),
-        ])
-        .send()?
-        .error_for_status()?
-        .json::<TokenResp>()?;
+    let resp = send_with_retries(
+        || {
+            client
+                .post("https://api.dropbox.com/oauth2/token")
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh.as_str()),
+                    ("client_id", key.as_str()),
+                    ("client_secret", secret.as_str()),
+                ])
+                .send()
+        },
+        "getting access token",
+    )?;
 
-    Ok(resp.access_token)
+    let token_resp = resp.error_for_status()?.json::<TokenResp>()?;
+    Ok(token_resp.access_token)
 }
 
 #[derive(Serialize)]
@@ -101,16 +107,52 @@ fn upload_file(client: &Client, token: &str, local: &Path, remote: &str) -> Resu
     };
     let arg_json = serde_json::to_string(&arg)?;
 
-    let request = client
-        .post("https://content.dropboxapi.com/2/files/upload")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/octet-stream")
-        .header("Dropbox-API-Arg", arg_json)
-        .body(buf);
+    // buf is cloned per attempt; fine for your tiny files and simple code.
+    let resp = send_with_retries(
+        || {
+            client
+                .post("https://content.dropboxapi.com/2/files/upload")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/octet-stream")
+                .header("Dropbox-API-Arg", arg_json.clone())
+                .body(buf.clone())
+                .send()
+        },
+        &format!("uploading {}", remote),
+    )?;
 
-    // println!("{:?}", request.build().unwrap());
-
-    request.send()?.error_for_status()?;
-
+    resp.error_for_status()?;
     Ok(())
+}
+
+/// Retry helper: retries on connect/DNS/timeout errors with backoff.
+fn send_with_retries<F>(mut make_req: F, what: &str) -> Result<Response>
+where
+    F: FnMut() -> Result<Response, reqwest::Error>,
+{
+    let delay = Duration::from_secs(5);
+    let max_attempts = 5;
+
+    for attempt in 1..=max_attempts {
+        match make_req() {
+            Ok(resp) => return Ok(resp),
+            Err(e) if e.is_connect() || e.is_timeout() => {
+                eprintln!(
+                    "[deckpush] {} attempt {}/{} failed: {}. Retrying in {:?}…",
+                    what, attempt, max_attempts, e, delay
+                );
+                thread::sleep(delay);
+            }
+            Err(e) => {
+                // Non-retriable error (4xx, bad URL, etc.)
+                return Err(e.into());
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "[deckpush] {}: giving up after {} attempts",
+        what,
+        max_attempts
+    ))
 }
