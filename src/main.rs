@@ -20,25 +20,30 @@ fn main() -> Result<()> {
     let client = Client::new();
     let token = get_access_token(&client)?;
 
-    for entry in WalkDir::new(&local_root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    for entry in WalkDir::new(&local_root).follow_links(true).into_iter() {
+        match entry {
+            Err(e) => {
+                println!("Error while walking files: {:?}", e);
+            }
+            Ok(entry) => {
+                if entry.file_type().is_file() {
+                    let local_path = entry.path();
+                    let rel = local_path
+                        .strip_prefix(&local_root)
+                        .context("Failed to relativize path")?;
+                    let remote_path = format!(
+                        "{}/{}",
+                        remote_root.trim_end_matches('/'),
+                        rel.to_string_lossy().replace('\\', "/")
+                    );
 
-        let local_path = entry.path();
-        let rel = local_path
-            .strip_prefix(&local_root)
-            .context("Failed to relativize path")?;
-        let remote_path = format!(
-            "{}/{}",
-            remote_root.trim_end_matches('/'),
-            rel.to_string_lossy().replace('\\', "/")
-        );
-
-        if let Err(e) = upload_file(&client, &token, local_path, &remote_path) {
-            eprintln!("ERROR: {} → {}: {e}", local_path.display(), remote_path);
-        } else {
-            println!("Uploaded: {}", remote_path);
+                    if let Err(e) = upload_file(&client, &token, local_path, &remote_path) {
+                        eprintln!("ERROR: {} → {}: {e}", local_path.display(), remote_path);
+                    } else {
+                        println!("Uploaded: {}", local_path.display());
+                    }
+                }
+            }
         }
     }
 
